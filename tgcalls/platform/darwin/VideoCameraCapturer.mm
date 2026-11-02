@@ -30,6 +30,7 @@
 namespace {
 
 static const int64_t kNanosecondsPerSecond = 1000000000;
+static char kCallTorchObservationContext;
 
 static tgcalls::DarwinVideoTrackSource *getObjCVideoSource(const webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> nativeSource) {
     webrtc::VideoTrackSourceProxy *proxy_source =
@@ -85,6 +86,8 @@ static UIDeviceOrientation deviceOrientation(UIInterfaceOrientation orientation)
     AVCaptureDevice *_currentDevice;
     BOOL _hasRetriedOnFatalError;
     BOOL _isRunning;
+    BOOL _observingTorch;
+    void (^_torchStateUpdated)(bool, bool);
 
 	// Live on RTCDispatcherTypeCaptureSession and main thread.
 	std::atomic<bool> _willBeRunning;
@@ -215,6 +218,8 @@ static UIDeviceOrientation deviceOrientation(UIInterfaceOrientation orientation)
                    selector:@selector(handleApplicationDidBecomeActive:)
                        name:UIApplicationDidBecomeActiveNotification
                      object:[UIApplication sharedApplication]];
+        [center addObserver:self selector:@selector(handleTorchApplicationDidEnterBackground:)
+                       name:UIApplicationDidEnterBackgroundNotification object:nil];
         [center addObserver:self
             selector:@selector(handleApplicationWillEnterForeground:)
                 name:UIApplicationWillEnterForegroundNotification
@@ -281,7 +286,79 @@ static UIDeviceOrientation deviceOrientation(UIInterfaceOrientation orientation)
 
 - (void)setIsEnabled:(bool)isEnabled {
     _isPaused = !isEnabled;
+    if (!isEnabled) {
+        [self setTorchEnabled:false];
+    } else {
+        [RTCDispatcher dispatchAsyncOnType:RTCDispatcherTypeCaptureSession block:^{ [self publishTorchState]; }];
+    }
     [self updateIsActiveValue];
+}
+
+// All torch/device access is serialized with capture-session configuration.
+- (bool)canUseTorch {
+    return _willBeRunning && _isRunning && !_isPaused && _captureSession.isRunning && !_captureSession.isInterrupted &&
+        _currentDevice.position == AVCaptureDevicePositionBack && _currentDevice.hasTorch &&
+        _currentDevice.isTorchAvailable && [_currentDevice isTorchModeSupported:AVCaptureTorchModeOn];
+}
+
+- (void)publishTorchState {
+    void (^updated)(bool, bool) = [_torchStateUpdated copy];
+    if (!updated) return;
+    bool available = [self canUseTorch];
+    bool enabled = _currentDevice.hasTorch && _currentDevice.isTorchActive;
+    dispatch_async(dispatch_get_main_queue(), ^{ updated(available, enabled); });
+}
+
+- (void)setOnTorchStateUpdated:(void (^)(bool, bool))updated {
+    [RTCDispatcher dispatchAsyncOnType:RTCDispatcherTypeCaptureSession block:^{
+        self->_torchStateUpdated = [updated copy];
+        [self publishTorchState];
+    }];
+}
+
+- (void)turnTorchOff {
+    AVCaptureDevice *device = _currentDevice;
+    if (device.hasTorch && [device isTorchModeSupported:AVCaptureTorchModeOff] &&
+        [device lockForConfiguration:nil]) {
+        device.torchMode = AVCaptureTorchModeOff;
+        [device unlockForConfiguration];
+    }
+}
+
+- (void)stopObservingTorch {
+    if (!_observingTorch) return;
+    [_currentDevice removeObserver:self forKeyPath:@"torchAvailable" context:&kCallTorchObservationContext];
+    [_currentDevice removeObserver:self forKeyPath:@"torchActive" context:&kCallTorchObservationContext];
+    _observingTorch = NO;
+}
+
+- (void)setTorchEnabled:(bool)enabled {
+    [RTCDispatcher dispatchAsyncOnType:RTCDispatcherTypeCaptureSession block:^{
+        if (!enabled) {
+            [self turnTorchOff];
+        } else if ([self canUseTorch]) {
+            AVCaptureDevice *device = self->_currentDevice;
+            NSError *error = nil;
+            if ([device lockForConfiguration:&error]) {
+                [device setTorchModeOnWithLevel:AVCaptureMaxAvailableTorchLevel error:&error];
+                [device unlockForConfiguration];
+            }
+        }
+        // Report the device's result, never an optimistic UI state.
+        [self publishTorchState];
+    }];
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
+    if (context == &kCallTorchObservationContext) {
+        [RTCDispatcher dispatchAsyncOnType:RTCDispatcherTypeCaptureSession block:^{ [self publishTorchState]; }];
+    } else {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+    }
+}
+
+- (void)handleTorchApplicationDidEnterBackground:(NSNotification *)notification {
+    [self setTorchEnabled:false];
 }
 
 - (void)setUncroppedSink:(std::shared_ptr<rtc::VideoSinkInterface<webrtc::VideoFrame>>)sink {
@@ -334,6 +411,8 @@ static UIDeviceOrientation deviceOrientation(UIInterfaceOrientation orientation)
           [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
       });
       
+      [self turnTorchOff];
+      [self stopObservingTorch];
       _currentDevice = device;
       
       NSError *error = nil;
@@ -353,6 +432,12 @@ static UIDeviceOrientation deviceOrientation(UIInterfaceOrientation orientation)
       [_captureSession startRunning];
       [_currentDevice unlockForConfiguration];
       _isRunning = YES;
+      if (_currentDevice.hasTorch) {
+          [_currentDevice addObserver:self forKeyPath:@"torchAvailable" options:0 context:&kCallTorchObservationContext];
+          [_currentDevice addObserver:self forKeyPath:@"torchActive" options:0 context:&kCallTorchObservationContext];
+          _observingTorch = YES;
+      }
+      [self publishTorchState];
       if (completionHandler) {
           completionHandler(nil);
       }
@@ -365,6 +450,8 @@ static UIDeviceOrientation deviceOrientation(UIInterfaceOrientation orientation)
    dispatchAsyncOnType:RTCDispatcherTypeCaptureSession
    block:^{
       RTCLogInfo("Stop");
+      [self turnTorchOff];
+      [self stopObservingTorch];
       _currentDevice = nil;
       for (AVCaptureDeviceInput *oldInput in [_captureSession.inputs copy]) {
           [_captureSession removeInput:oldInput];
@@ -375,6 +462,7 @@ static UIDeviceOrientation deviceOrientation(UIInterfaceOrientation orientation)
           [[UIDevice currentDevice] endGeneratingDeviceOrientationNotifications];
       });
       _isRunning = NO;
+      [self publishTorchState];
       if (completionHandler) {
           completionHandler();
       }
@@ -728,6 +816,7 @@ static UIDeviceOrientation deviceOrientation(UIInterfaceOrientation orientation)
 #pragma mark - AVCaptureSession notifications
 
 - (void)handleCaptureSessionInterruption:(NSNotification *)notification {
+    [self setTorchEnabled:false];
     NSString *reasonString = nil;
     NSNumber *reason = notification.userInfo[AVCaptureSessionInterruptionReasonKey];
     if (reason) {
@@ -751,9 +840,11 @@ static UIDeviceOrientation deviceOrientation(UIInterfaceOrientation orientation)
 
 - (void)handleCaptureSessionInterruptionEnded:(NSNotification *)notification {
     RTCLog(@"Capture session interruption ended.");
+    [RTCDispatcher dispatchAsyncOnType:RTCDispatcherTypeCaptureSession block:^{ [self publishTorchState]; }];
 }
 
 - (void)handleCaptureSessionRuntimeError:(NSNotification *)notification {
+    [self setTorchEnabled:false];
     NSError *error = [notification.userInfo objectForKey:AVCaptureSessionErrorKey];
     RTCLogError(@"Capture session runtime error: %@", error);
 
@@ -775,6 +866,7 @@ static UIDeviceOrientation deviceOrientation(UIInterfaceOrientation orientation)
         // If we successfully restarted after an unknown error,
         // allow future retries on fatal errors.
         _hasRetriedOnFatalError = NO;
+        [self publishTorchState];
     }];
     
     _inForegroundValue = true;
@@ -783,6 +875,7 @@ static UIDeviceOrientation deviceOrientation(UIInterfaceOrientation orientation)
 
 - (void)handleCaptureSessionDidStopRunning:(NSNotification *)notification {
   RTCLog(@"Capture session stopped.");
+    [self setTorchEnabled:false];
     _inForegroundValue = false;
     [self updateIsActiveValue];
 }
