@@ -1,4 +1,5 @@
 #include "VideoCameraCapturer.h"
+#import "CallVideoEffects.h"
 
 #import <AVFoundation/AVFoundation.h>
 
@@ -109,6 +110,7 @@ static UIDeviceOrientation deviceOrientation(UIInterfaceOrientation orientation)
 
     // Live on frameQueue.
     float _aspectRatio;
+    CallVideoEffectsProcessor *_effectsProcessor;
     std::vector<uint8_t> _croppingBuffer;
     std::weak_ptr<rtc::VideoSinkInterface<webrtc::VideoFrame>> _uncroppedSink;
     
@@ -491,6 +493,15 @@ static UIDeviceOrientation deviceOrientation(UIInterfaceOrientation orientation)
     return nullptr;
 }
 
+- (void)setVideoFilter:(int32_t)filter intensity:(float)intensity mask:(int32_t)mask {
+    dispatch_async(_frameQueue, ^{
+        if (!self->_effectsProcessor) self->_effectsProcessor = [[CallVideoEffectsProcessor alloc] init];
+        [self->_effectsProcessor setFilter:filter intensity:intensity mask:mask];
+        // Keep real-time video current when face detection takes longer than a frame.
+        self->_videoDataOutput.alwaysDiscardsLateVideoFrames = mask != 0 || (filter != 0 && intensity > 0.0f);
+    });
+}
+
 - (void)captureOutput:(AVCaptureOutput *)captureOutput
     didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
            fromConnection:(AVCaptureConnection *)connection {
@@ -577,6 +588,9 @@ static UIDeviceOrientation deviceOrientation(UIInterfaceOrientation orientation)
         }
     }
     
+    // Apply once, before the local-preview and outgoing-video paths diverge.
+    CVPixelBufferRef effectedBuffer = _effectsProcessor ? [_effectsProcessor copyPixelBuffer:pixelBuffer rotation:_rotation] : NULL;
+    if (effectedBuffer) pixelBuffer = effectedBuffer;
     TGRTCCVPixelBuffer *rtcPixelBuffer = [[TGRTCCVPixelBuffer alloc] initWithPixelBuffer:pixelBuffer];
     rtcPixelBuffer.shouldBeMirrored = usingFrontCamera;
     rtcPixelBuffer.deviceRelativeVideoRotation = deviceRelativeVideoRotation;
@@ -637,6 +651,8 @@ static UIDeviceOrientation deviceOrientation(UIInterfaceOrientation orientation)
         }
     }
     
+    if (effectedBuffer) CVPixelBufferRelease(effectedBuffer);
+
     int64_t timeStampNs = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)) * kNanosecondsPerSecond;
 
     //RTCVideoFrame *videoFrame = [[RTCVideoFrame alloc] initWithBuffer:rtcPixelBuffer rotation:_rotation timeStampNs:timeStampNs];

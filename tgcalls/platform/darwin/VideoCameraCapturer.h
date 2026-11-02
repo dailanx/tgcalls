@@ -21,6 +21,7 @@
 - (void)startCaptureWithDevice:(AVCaptureDevice *)device format:(AVCaptureDeviceFormat *)format fps:(NSInteger)fps;
 - (void)stopCapture;
 - (void)setIsEnabled:(bool)isEnabled;
+- (void)setVideoFilter:(int32_t)filter intensity:(float)intensity mask:(int32_t)mask;
 - (void)setPreferredCaptureAspectRatio:(float)aspectRatio;
 - (void)setUncroppedSink:(std::shared_ptr<rtc::VideoSinkInterface<webrtc::VideoFrame>>)sink;
 - (int)getRotation;
